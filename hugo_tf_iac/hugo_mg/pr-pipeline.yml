@@ -1,0 +1,18 @@
+name: "$(TeamProject)_$(Build.DefinitionName)_$(Date:yyyyMMdd)$(Rev:.r)"
+
+trigger:
+  branches:
+    include:
+      - main
+
+stages:
+  - stage: build
+    displayName: "build"
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - template: templates/jobs/shift_left.yaml
+        parameters:
+          PythonVersion: "3.10"
+          workingDirectory: "tests/ci"
+          name: "shift_left"

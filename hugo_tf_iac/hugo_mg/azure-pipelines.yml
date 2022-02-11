@@ -1,0 +1,296 @@
+name: "$(TeamProject)_$(Build.DefinitionName)_$(Date:yyyyMMdd)$(Rev:.r)"
+
+trigger:
+  branches:
+    include:
+      - azure-pipelines
+      - main
+
+variables:
+  - name: Stage.Statefile
+    value: '$(System.TeamProject)_$(Build.DefinitionName)_$(System.StageName)'
+  - name: Terraform.Folder
+    value: '$(System.DefaultWorkingDirectory)/iac'
+
+stages:
+  - stage: build
+    displayName: "build"
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - template: templates/jobs/shift_left.yaml
+        parameters:
+          PythonVersion: "3.10"
+          workingDirectory: "tests/ci"
+          name: "shift_left"
+      - job: artifact
+        dependsOn: "shift_left"
+        steps:
+          - checkout: self
+            submodules: true
+            persistCredentials: true
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.10'
+            inputs:
+              versionSpec: 3.10
+          - task: HugoTask@1
+            displayName: 'Hugo generate '
+            inputs:
+              destination: public
+              extendedVersion: true
+              buildDrafts: true
+          - task: CopyFiles@2
+            displayName: 'Copy Files to: $(Build.ArtifactStagingDirectory)/site'
+            inputs:
+              SourceFolder: public
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/site'
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Artifact: drop'
+          - template: templates/steps/azdo_git_tag.yaml
+  - stage: dev
+    displayName: "dev"
+    dependsOn: build
+    variables:
+      - group: ce02-Azure-Terraform-dev
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: deploy
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '1.0.11'
+          - template: templates/steps/azdo_terraform_access_token.yaml
+            parameters:
+              Folder: "."
+          - task: TerraformTaskV2@2
+            displayName: init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(Terraform.Folder)'
+              backendServiceArm: 'ce02-Azure-Terraform-dev'
+              backendAzureRmResourceGroupName: '$(Tf.ResourceGroup)'
+              backendAzureRmStorageAccountName: '$(Tf.StorageAccount)'
+              backendAzureRmContainerName: '$(Tf.StorageContainer)'
+              backendAzureRmKey: '$(Stage.Statefile)'
+          - task: TerraformTaskV2@2
+            displayName: plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(Terraform.folder)'
+              commandOptions: '-var-file=./config/$(System.StageName).tfvars -out=plan.tfplan -input=false -var="env=$(System.StageName)"'
+              environmentServiceNameAzureRM: 'ce02-Azure-Terraform-dev'
+          - task: TerraformTaskV2@2
+            displayName: apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(Terraform.Folder)'
+              commandOptions: 'plan.tfplan'
+              environmentServiceNameAzureRM: 'ce02-Azure-Terraform-dev'
+          - task: terraform-outputs@0
+            inputs:
+              workingDirectory: '$(Terraform.Folder)'
+              mapSensitiveOutputsAsSecrets: false
+              variablePrefix: 'azure.tf.'
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the prebuilt site"
+            inputs:
+              buildType: 'current'
+              artifactName: 'drop'
+              targetPath: '$(Pipeline.Workspace)'
+          - task: AzureFileCopy@3
+            displayName: "Upload the site to azure storage"
+            inputs:
+              SourcePath: '$(Pipeline.Workspace)/site'
+              azureSubscription: 'ce02-Azure-Terraform-dev'
+              Destination: 'AzureBlob'
+              storage: '$(azure.tf.ice_storage_account_made)'
+              ContainerName: '$web'
+              sasTokenTimeOutInMinutes: '5'
+          - task: CmdLine@2
+            inputs:
+              script: 'tree/f'
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.10'
+            inputs:
+              versionSpec: 3.10
+          - task: CmdLine@2
+            displayName: "Run UX Tests"
+            inputs:
+              script: |
+                pip install -r requirements.txt
+                pytest --url $(azure.tf.ice_url) --headless=yes --junitxml=TEST-selenium-$(System.StageName).xml
+              workingDirectory: 'tests/ux'
+  - stage: test
+    displayName: "test"
+    dependsOn: dev
+    variables:
+      - group: ce02-Azure-Terraform-test
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: deploy
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '1.0.11'
+          - template: templates/steps/azdo_terraform_access_token.yaml
+            parameters:
+              Folder: "."
+          - task: TerraformTaskV2@2
+            displayName: init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(Terraform.Folder)'
+              backendServiceArm: 'ce02-Azure-Terraform-test'
+              backendAzureRmResourceGroupName: '$(Tf.ResourceGroup)'
+              backendAzureRmStorageAccountName: '$(Tf.StorageAccount)'
+              backendAzureRmContainerName: '$(Tf.StorageContainer)'
+              backendAzureRmKey: '$(Stage.Statefile)'
+          - task: TerraformTaskV2@2
+            displayName: plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(Terraform.folder)'
+              commandOptions: '-var-file=./config/$(System.StageName).tfvars -out=plan.tfplan -input=false -var="env=$(System.StageName)"'
+              environmentServiceNameAzureRM: 'ce02-Azure-Terraform-test'
+          - task: TerraformTaskV2@2
+            displayName: apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(Terraform.Folder)'
+              commandOptions: 'plan.tfplan'
+              environmentServiceNameAzureRM: 'ce02-Azure-Terraform-test'
+          - task: terraform-outputs@0
+            inputs:
+              workingDirectory: '$(Terraform.Folder)'
+              mapSensitiveOutputsAsSecrets: false
+              variablePrefix: 'azure.tf.'
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the prebuilt site"
+            inputs:
+              buildType: 'current'
+              artifactName: 'drop'
+              targetPath: '$(Pipeline.Workspace)'
+          - task: AzureFileCopy@3
+            displayName: "Upload the site to azure storage"
+            inputs:
+              SourcePath: '$(Pipeline.Workspace)/site'
+              azureSubscription: 'ce02-Azure-Terraform-test'
+              Destination: 'AzureBlob'
+              storage: '$(azure.tf.ice_storage_account_made)'
+              ContainerName: '$web'
+              sasTokenTimeOutInMinutes: '5'
+          - task: CmdLine@2
+            inputs:
+              script: 'tree/f'
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.10'
+            inputs:
+              versionSpec: 3.10
+          - task: CmdLine@2
+            displayName: "Run UX Tests"
+            inputs:
+              script: |
+                pip install -r requirements.txt
+                pytest --url $(azure.tf.ice_url) --headless=yes --junitxml=TEST-selenium-$(System.StageName).xml
+              workingDirectory: "tests/ux"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/Test-*.xml"
+            inputs:
+              failTaskOnFailedTests: true
+            condition: always()
+  - stage: prod
+    displayName: "prod"
+    dependsOn: test
+    variables:
+      - group: ce02-Azure-Terraform-prod
+    pool:
+      vmImage: windows-latest
+    jobs:
+      - job: deploy
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '1.0.11'
+          - template: templates/steps/azdo_terraform_access_token.yaml
+            parameters:
+              Folder: "."
+          - task: TerraformTaskV2@2
+            displayName: init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(Terraform.Folder)'
+              backendServiceArm: 'ce02-Azure-Terraform-prod'
+              backendAzureRmResourceGroupName: '$(Tf.ResourceGroup)'
+              backendAzureRmStorageAccountName: '$(Tf.StorageAccount)'
+              backendAzureRmContainerName: '$(Tf.StorageContainer)'
+              backendAzureRmKey: '$(Stage.Statefile)'
+          - task: TerraformTaskV2@2
+            displayName: plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(Terraform.folder)'
+              commandOptions: '-var-file=./config/$(System.StageName).tfvars -out=plan.tfplan -input=false -var="env=$(System.StageName)"'
+              environmentServiceNameAzureRM: 'ce02-Azure-Terraform-prod'
+          - task: TerraformTaskV2@2
+            displayName: apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(Terraform.Folder)'
+              commandOptions: 'plan.tfplan'
+              environmentServiceNameAzureRM: 'ce02-Azure-Terraform-prod'
+          - task: terraform-outputs@0
+            inputs:
+              workingDirectory: '$(Terraform.Folder)'
+              mapSensitiveOutputsAsSecrets: false
+              variablePrefix: 'azure.tf.'
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the prebuilt site"
+            inputs:
+              buildType: 'current'
+              artifactName: 'drop'
+              targetPath: '$(Pipeline.Workspace)'
+          - task: AzureFileCopy@3
+            displayName: "Upload the site to azure storage"
+            inputs:
+              SourcePath: '$(Pipeline.Workspace)/site'
+              azureSubscription: 'ce02-Azure-Terraform-prod'
+              Destination: 'AzureBlob'
+              storage: '$(azure.tf.ice_storage_account_made)'
+              ContainerName: '$web'
+              sasTokenTimeOutInMinutes: '5'
+          - task: CmdLine@2
+            inputs:
+              script: 'tree/f'
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.10'
+            inputs:
+              versionSpec: 3.10
+          - task: CmdLine@2
+            displayName: "Run UX Tests"
+            inputs:
+              script: |
+                pip install -r requirements.txt
+                pytest --url $(azure.tf.ice_url) --headless=yes --junitxml=TEST-selenium-$(System.StageName).xml
+              workingDirectory: "tests/ux"
+          - task: PublishTestResults@2
+            displayName: "Publish Test Results **/Test-*.xml"
+            inputs:
+              failTaskOnFailedTests: true
+            condition: always()
